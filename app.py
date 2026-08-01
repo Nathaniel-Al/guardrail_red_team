@@ -22,6 +22,11 @@ MAX_RESULT_CHARS = 4000
 
 _MULTI_SLASH_RE = re.compile(r"/{2,}")
 
+_DOT_CONFUSABLES = "\u3002\uFF61\u2024\u2025\u2026\uFE52\uFF0E"
+_SLASH_CONFUSABLES = "\u2044\u2215\u2571\u29F8\uFF0F\u244A"
+_CONFUSABLE_TRANSLATION = {ord(c): "." for c in _DOT_CONFUSABLES}
+_CONFUSABLE_TRANSLATION.update({ord(c): "/" for c in _SLASH_CONFUSABLES})
+
 
 def _resolve_against_sandbox(candidate_str):
     if candidate_str.startswith("/"):
@@ -35,6 +40,8 @@ def _repeated_unquote(s, max_rounds=10):
     prev = s
     for _ in range(max_rounds):
         nxt = unquote(prev)
+        if "\ufffd" in nxt and "\ufffd" not in prev:
+            return nxt, False
         if nxt == prev:
             return prev, True
         prev = nxt
@@ -44,7 +51,8 @@ def _repeated_unquote(s, max_rounds=10):
 def _strict_safety_variant(raw_path):
     decoded, converged = _repeated_unquote(raw_path)
     normalized = unicodedata.normalize("NFKC", decoded)
-    slashed = normalized.replace("\\", "/")
+    confusables_folded = normalized.translate(_CONFUSABLE_TRANSLATION)
+    slashed = confusables_folded.replace("\\", "/")
     collapsed = _MULTI_SLASH_RE.sub("/", slashed)
     return collapsed, converged
 
@@ -194,6 +202,9 @@ def validate_url_target(url):
     if "\\" in url:
         return False, "URL contains a backslash, which is not permitted."
 
+    if "@" in url:
+        return False, "URL contains userinfo ('@'), which is not permitted."
+
     host, reason = _cross_validated_host(url)
     if host is None:
         return False, reason
@@ -205,6 +216,14 @@ def validate_url_target(url):
 
     if not host_allowed(host):
         return False, f"Host '{host}' is not on the allowed list of exact hosts."
+
+    default_port = {"http": 80, "https": 443}[scheme]
+    try:
+        port = parsed.port
+    except ValueError:
+        return False, "URL has a malformed port."
+    if port is not None and port != default_port:
+        return False, f"Port {port} is not permitted; only the default port for '{scheme}' is allowed."
 
     try:
         ipaddress.ip_address(host)
