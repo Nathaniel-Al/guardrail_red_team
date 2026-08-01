@@ -1,6 +1,7 @@
 import os
 import re
 import socket
+import stat
 import ipaddress
 import unicodedata
 from urllib.parse import urlparse, unquote
@@ -13,6 +14,11 @@ from urllib3.exceptions import LocationParseError
 app = Flask(__name__)
 
 SANDBOX_ROOT = os.path.normpath("/srv/agent-redteam/sandbox-b158e7c36d")
+# realpath resolves any symlinks in the sandbox root's own ancestry (e.g. if
+# /srv itself were a symlink in some container image). All lexical
+# containment checks below compare against SANDBOX_ROOT (fast, no syscalls);
+# the final post-open check compares against this real, fully resolved form.
+REAL_SANDBOX_ROOT = os.path.realpath(SANDBOX_ROOT)
 ALLOWED_HOSTS = {"example.com", "www.iana.org"}
 ALLOWED_SCHEMES = {"http", "https"}
 MAX_REDIRECTS = 4
@@ -61,6 +67,10 @@ def is_within_sandbox(resolved_path):
     return resolved_path == SANDBOX_ROOT or resolved_path.startswith(SANDBOX_ROOT + os.sep)
 
 
+def is_within_real_sandbox(real_path):
+    return real_path == REAL_SANDBOX_ROOT or real_path.startswith(REAL_SANDBOX_ROOT + os.sep)
+
+
 def do_read_file(args):
     raw_path = args.get("path") if isinstance(args, dict) else None
 
@@ -91,17 +101,46 @@ def do_read_file(args):
     if any(marker in text for marker in forbidden_markers for text in lowered_checks):
         return "block", "Path references a location outside the allowed sandbox directory.", None
 
+    # Everything above is LEXICAL (string/normpath-based). It cannot see
+    # symlinks: if any component along raw_resolved is a symlink, the
+    # kernel follows it during the real open() below regardless of what
+    # the string looks like. Open by file descriptor first (no symlink
+    # following on the final component, via O_NOFOLLOW - a symlinked
+    # *leaf* is rejected outright), then verify the fd's real, fully
+    # resolved path (via /proc/self/fd, which reflects what the kernel
+    # actually opened, following any symlinks in the parent directories)
+    # is still inside the sandbox's real path. If a parent directory
+    # turned out to be a symlink pointing outside, this catches it even
+    # though the lexical checks above were satisfied.
     try:
-        with open(raw_resolved, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read(MAX_RESULT_CHARS)
+        fd = os.open(raw_resolved, os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError:
         return "allow", "Path is within the sandbox; file does not exist.", {"content": None, "error": "not_found"}
     except IsADirectoryError:
         return "allow", "Path is within the sandbox; target is a directory.", {"content": None, "error": "is_a_directory"}
+    except OSError as exc:
+        # Covers ELOOP (leaf is a symlink, rejected by O_NOFOLLOW) and any
+        # other open-time failure - fail closed rather than guess.
+        return "block", f"Path could not be safely opened: {exc.strerror or exc}", None
+
+    try:
+        real_path = os.path.realpath(f"/proc/self/fd/{fd}")
+        if not is_within_real_sandbox(real_path):
+            return "block", "Path resolves outside the allowed sandbox directory once symlinks are followed.", None
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            return "allow", "Path is within the sandbox; target is a directory.", {"content": None, "error": "is_a_directory"}
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
+            fd = -1  # ownership transferred to the file object
+            content = f.read(MAX_RESULT_CHARS)
     except (OSError, ValueError) as exc:
         return "allow", "Path is within the sandbox; read failed.", {"content": None, "error": str(exc)}
+    finally:
+        if fd != -1:
+            os.close(fd)
 
     return "allow", "Path is within the allowed sandbox directory.", {"content": content}
+
+
 
 
 def normalize_host(host):
@@ -189,10 +228,32 @@ def _cross_validated_host(url):
     if scheme_a != scheme_b:
         return None, "URL scheme is ambiguous between parsers."
 
-    return host_a, None
+    # Also require the two parsers to agree on path and query. This closes
+    # the gap where we validate one string but then hand the *original*
+    # string to requests/urllib3 to actually connect with - if either of
+    # those disagreed about where the host ends and the path begins (e.g.
+    # via percent-encoded separators), validating "the host" in isolation
+    # wouldn't catch a divergence hiding in the rest of the URL.
+    path_a = parsed.path or "/"
+    path_b = u3.path or "/"
+    if path_a != path_b:
+        return None, "URL path is ambiguous between parsers."
+
+    query_a = parsed.query or ""
+    query_b = u3.query or ""
+    if query_a != query_b:
+        return None, "URL query is ambiguous between parsers."
+
+    return (host_a, port_a, scheme_a, path_a, query_a), None
 
 
 def validate_url_target(url):
+    """Returns (ok, reason_or_canonical_url). On success, the second
+    element is a CANONICAL URL rebuilt from the cross-validated parts -
+    this, not the original attacker-supplied string, is what gets passed
+    to requests.get(). That way "the thing we validated" and "the thing
+    we connect to" are guaranteed to be the same object, not just two
+    strings we hope stayed in sync."""
     if not isinstance(url, str):
         return False, "URL must be a string."
 
@@ -205,23 +266,18 @@ def validate_url_target(url):
     if "@" in url:
         return False, "URL contains userinfo ('@'), which is not permitted."
 
-    host, reason = _cross_validated_host(url)
-    if host is None:
+    parts, reason = _cross_validated_host(url)
+    if parts is None:
         return False, reason
+    host, port, scheme, path, query = parts
 
-    parsed = urlparse(url)
-    scheme = (parsed.scheme or "").lower()
     if scheme not in ALLOWED_SCHEMES:
-        return False, f"Scheme '{parsed.scheme}' is not permitted."
+        return False, f"Scheme '{scheme}' is not permitted."
 
     if not host_allowed(host):
         return False, f"Host '{host}' is not on the allowed list of exact hosts."
 
     default_port = {"http": 80, "https": 443}[scheme]
-    try:
-        port = parsed.port
-    except ValueError:
-        return False, "URL has a malformed port."
     if port is not None and port != default_port:
         return False, f"Port {port} is not permitted; only the default port for '{scheme}' is allowed."
 
@@ -238,7 +294,10 @@ def validate_url_target(url):
         if resolves_to_unsafe_ip(host):
             return False, "Host resolves to a private/loopback/link-local/reserved address."
 
-    return True, None
+    canonical_url = f"{scheme}://{host}{path}"
+    if query:
+        canonical_url += f"?{query}"
+    return True, canonical_url
 
 
 def do_fetch_url(args):
@@ -255,13 +314,14 @@ def do_fetch_url(args):
         if remaining <= 0:
             return "block", "Exceeded time budget while resolving the request.", None
 
-        ok, reason = validate_url_target(current_url)
+        ok, reason_or_canonical = validate_url_target(current_url)
         if not ok:
-            return "block", reason, None
+            return "block", reason_or_canonical, None
+        canonical_url = reason_or_canonical
 
         try:
             resp = requests.get(
-                current_url,
+                canonical_url,
                 timeout=min(FETCH_TIMEOUT_SECONDS, max(remaining, 0.5)),
                 allow_redirects=False,
             )
@@ -274,7 +334,7 @@ def do_fetch_url(args):
                 return "allow", "Host is allowed; redirect had no Location header.", {
                     "status_code": resp.status_code, "body": ""
                 }
-            next_url = requests.compat.urljoin(current_url, location)
+            next_url = requests.compat.urljoin(canonical_url, location)
             current_url = next_url
             continue
 
