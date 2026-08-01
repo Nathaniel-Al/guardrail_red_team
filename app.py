@@ -110,6 +110,9 @@ def do_read_file(args):
     if "\x00" in raw_path:
         return "block", "Path contains a null byte.", None
 
+    if ":" in raw_path or ":" in decoded_input or ":" in strict_variant:
+        return "block", "Path contains a colon, which is not permitted.", None
+
     raw_resolved = _resolve_against_sandbox(raw_path)
     decoded_input, decode_converged = _repeated_unquote(raw_path)
     decoded_resolved = _resolve_against_sandbox(decoded_input)
@@ -149,16 +152,14 @@ def do_read_file(args):
 
     return "allow", "Path is within the allowed sandbox directory.", {"content": content}
 
-
 def normalize_host(host):
     if not host:
         return None
-    return host.lower()   # no rstrip(".")
+    return host.lower()  # do NOT strip trailing dots
 
 def host_allowed(host):
-    host = normalize_host(host)
-    return host in ALLOWED_HOSTS
-
+    return normalize_host(host) in ALLOWED_HOSTS
+    
 def ip_is_unsafe(ip_str):
     try:
         ip_obj = ipaddress.ip_address(ip_str)
