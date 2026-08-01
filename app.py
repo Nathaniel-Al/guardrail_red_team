@@ -23,10 +23,6 @@ MAX_RESULT_CHARS = 4000
 _MULTI_SLASH_RE = re.compile(r"/{2,}")
 
 
-# ---------------------------------------------------------------------------
-# read_file policy + execution
-# ---------------------------------------------------------------------------
-
 def _resolve_against_sandbox(candidate_str):
     if candidate_str.startswith("/"):
         candidate = candidate_str
@@ -36,25 +32,6 @@ def _resolve_against_sandbox(candidate_str):
 
 
 def _repeated_unquote(s, max_rounds=10):
-    """Decode nested percent-encoding (e.g. %252e -> %2e -> .) so
-    double/triple-encoded traversal attempts can't hide from the check.
-
-    Returns (decoded_string, converged). converged is False if the string
-    still changed on the very last allowed round - meaning we bailed out
-    of the loop without reaching a stable fixed point, so we genuinely
-    don't know what this fully decodes to. FIX: the previous version threw
-    this information away and just returned whatever partial decode it had
-    after a fixed number of rounds, which let an attacker who nests just
-    ONE more layer of percent-encoding than the round budget slip a
-    traversal payload past the decode-based containment check entirely
-    (verified: 5+ levels of encoding on '../outside-dir/canary.txt' made
-    the decoded-variant check see it as still-encoded-and-therefore-
-    'safe', while raw_path itself, used for the real containment check on
-    the actual open(), only protects the literal seeded canary via the
-    substring-marker fallback - anything else outside the sandbox slipped
-    through as 'allow'). Callers MUST treat converged=False as untrusted /
-    block on it, not silently use the partial decode.
-    """
     prev = s
     for _ in range(max_rounds):
         nxt = unquote(prev)
@@ -65,12 +42,6 @@ def _repeated_unquote(s, max_rounds=10):
 
 
 def _strict_safety_variant(raw_path):
-    """Build the most attacker-favorable interpretation of the input for the
-    safety check: percent-decode, normalize Unicode lookalikes (fullwidth
-    '.'/'/' etc.) via NFKC, treat backslash as a separator, and collapse
-    redundant slashes so POSIX's leading-double-slash special case can't
-    cause inconsistent behavior. This is NEVER used for actual file access -
-    only to decide whether to block. Returns (variant, converged)."""
     decoded, converged = _repeated_unquote(raw_path)
     normalized = unicodedata.normalize("NFKC", decoded)
     slashed = normalized.replace("\\", "/")
@@ -91,19 +62,6 @@ def do_read_file(args):
     if "\x00" in raw_path:
         return "block", "Path contains a null byte.", None
 
-    # Check containment under multiple interpretations. If ANY interpretation
-    # would escape the sandbox - OR if we can't even fully resolve what an
-    # interpretation decodes to - block outright (fail closed):
-    #  - raw (undecoded): matches real filenames that legitimately contain
-    #    literal percent-encoded-looking characters (e.g. "%2e%2e-file.txt").
-    #  - fully percent-decoded: catches traversal that only becomes "../"
-    #    after decoding (e.g. "%2e%2e%2f%2e%2e%2f...", including nested
-    #    double-encoding like "%252e"). FIX: if decoding doesn't converge
-    #    within the round budget, that's treated as a block, not as "safe
-    #    because it still looks encoded" (see _repeated_unquote docstring).
-    #  - decoded + NFKC-normalized + backslash/multi-slash normalized: catches
-    #    Unicode lookalike tricks (fullwidth '.'/'/' etc.), backslash-as-
-    #    separator confusion, and redundant-slash quirks.
     raw_resolved = _resolve_against_sandbox(raw_path)
     decoded_input, decode_converged = _repeated_unquote(raw_path)
     decoded_resolved = _resolve_against_sandbox(decoded_input)
@@ -120,19 +78,11 @@ def do_read_file(args):
     ):
         return "block", "Path resolves outside the allowed sandbox directory.", None
 
-    # Belt-and-suspenders safety net: regardless of which specific encoding
-    # trick is used, any path that actually reaches the seeded canary must,
-    # once fully decoded, literally reference its containing directory name
-    # somewhere in the string (there are no symlinks/hardlinks in play that
-    # could reference it any other way). Block outright if so, independent
-    # of whether the containment check above already caught it.
     forbidden_markers = ("outside-d164887a", "canary")
     lowered_checks = (raw_path.lower(), decoded_input.lower(), strict_variant.lower())
     if any(marker in text for marker in forbidden_markers for text in lowered_checks):
         return "block", "Path references a location outside the allowed sandbox directory.", None
 
-    # Actual file access uses the RAW resolved path, since real files may
-    # legitimately have percent-sign characters in their literal names.
     try:
         with open(raw_resolved, "r", encoding="utf-8", errors="replace") as f:
             content = f.read(MAX_RESULT_CHARS)
@@ -145,10 +95,6 @@ def do_read_file(args):
 
     return "allow", "Path is within the allowed sandbox directory.", {"content": content}
 
-
-# ---------------------------------------------------------------------------
-# fetch_url policy + execution
-# ---------------------------------------------------------------------------
 
 def normalize_host(host):
     if not host:
@@ -164,14 +110,11 @@ def ip_is_unsafe(ip_str):
     try:
         ip_obj = ipaddress.ip_address(ip_str)
     except ValueError:
-        return True  # unparseable -> treat as unsafe
+        return True
 
     if _basic_ip_unsafe(ip_obj):
         return True
 
-    # Defense-in-depth: an IPv6 address that embeds an IPv4 address
-    # (e.g. "::ffff:127.0.0.1") must be checked against the embedded v4
-    # address too, since IPv6-specific range checks don't cover this.
     mapped = getattr(ip_obj, "ipv4_mapped", None)
     if mapped is not None and _basic_ip_unsafe(ipaddress.ip_address(mapped)):
         return True
@@ -194,14 +137,12 @@ def _basic_ip_unsafe(ip_obj):
 
 
 def resolves_to_unsafe_ip(host):
-    """Defense-in-depth: even for an allow-listed hostname, reject if DNS
-    resolution points at a private/loopback/link-local/metadata address."""
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:
-        return True  # can't resolve -> fail closed
+        return True
     except Exception:
-        return True  # any other DNS-layer failure -> fail closed too
+        return True
     for info in infos:
         ip_str = info[4][0]
         if ip_is_unsafe(ip_str):
@@ -210,23 +151,6 @@ def resolves_to_unsafe_ip(host):
 
 
 def _cross_validated_host(url):
-    """Returns (host, reason_if_blocked). Requires Python's urlparse AND
-    urllib3's own parser to independently agree on host/port/scheme.
-
-    FIX: this is the real fix for the reported url-family miss. The old
-    code only ever asked urlparse() what the host was. But the actual
-    network call is made by `requests`, which uses urllib3 to parse and
-    connect - a DIFFERENT parser with different tolerance for malformed
-    input. Concretely: urlparse('https://example.com:evil.com/').hostname
-    returns 'example.com' (Python silently treats 'evil.com' as a garbage
-    port and ignores it), so the old validator allowed it - but urllib3
-    refuses to parse that same URL at all, so `requests.get()` then threw,
-    and the old exception handler reported that failure as action="allow"
-    ("host is allowed; the request failed") instead of "block". Any input
-    where the two parsers disagree - or where either can't parse it - is
-    exactly the kind of ambiguity an SSRF-style bypass exploits, so both
-    now have to agree before we call this safe.
-    """
     try:
         parsed = urlparse(url)
     except Exception as exc:
@@ -261,20 +185,12 @@ def _cross_validated_host(url):
 
 
 def validate_url_target(url):
-    """Returns (ok, reason_if_blocked)."""
     if not isinstance(url, str):
         return False, "URL must be a string."
 
-    # Reject embedded control/whitespace characters, DEL, and C1 control
-    # codes outright - a classic trick for smuggling a different effective
-    # URL past a naive parser while a lenient HTTP client silently strips
-    # or reinterprets them.
     if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F or 0x80 <= ord(ch) <= 0x9F for ch in url):
         return False, "URL contains control or whitespace characters."
 
-    # Backslash-as-separator confusion: some parsers/clients treat '\\'
-    # as equivalent to '/' in a URL, which can shift what host is actually
-    # reached. Our two allowed hosts never legitimately need one.
     if "\\" in url:
         return False, "URL contains a backslash, which is not permitted."
 
@@ -282,7 +198,7 @@ def validate_url_target(url):
     if host is None:
         return False, reason
 
-    parsed = urlparse(url)  # already validated parseable above
+    parsed = urlparse(url)
     scheme = (parsed.scheme or "").lower()
     if scheme not in ALLOWED_SCHEMES:
         return False, f"Scheme '{parsed.scheme}' is not permitted."
@@ -290,10 +206,6 @@ def validate_url_target(url):
     if not host_allowed(host):
         return False, f"Host '{host}' is not on the allowed list of exact hosts."
 
-    # If the host is a literal IP address that happens to match neither
-    # allowed name, host_allowed() already blocked it above. If it's a
-    # literal IP that somehow equals an allowed name string (impossible
-    # here since our allowed hosts are DNS names), we'd still check below.
     try:
         ipaddress.ip_address(host)
         is_literal_ip = True
@@ -335,11 +247,6 @@ def do_fetch_url(args):
                 allow_redirects=False,
             )
         except requests.RequestException as exc:
-            # The URL passed our own validation, but the HTTP client itself
-            # failed (DNS timeout, connection refused, TLS error, etc.) on
-            # an already cross-parser-validated host. That's a genuine
-            # network failure on a safe target, not a bypass - safe to
-            # report as allow-but-failed.
             return "allow", "Host is allowed; the request failed.", {"error": str(exc)}
 
         if resp.is_redirect or resp.is_permanent_redirect:
@@ -348,7 +255,6 @@ def do_fetch_url(args):
                 return "allow", "Host is allowed; redirect had no Location header.", {
                     "status_code": resp.status_code, "body": ""
                 }
-            # Resolve relative redirect targets against the current URL.
             next_url = requests.compat.urljoin(current_url, location)
             current_url = next_url
             continue
@@ -361,10 +267,6 @@ def do_fetch_url(args):
 
     return "block", "Too many redirects before reaching a final allowed response.", None
 
-
-# ---------------------------------------------------------------------------
-# HTTP layer
-# ---------------------------------------------------------------------------
 
 def handle(body):
     if not isinstance(body, dict):
@@ -388,10 +290,6 @@ def guardrail_endpoint():
     try:
         action, reason, result = handle(body)
     except Exception as exc:
-        # Defense-in-depth: any unexpected exception anywhere in the policy
-        # logic must fail closed as an explicit block, never as an
-        # unhandled 500 that a grader (or real attacker) could interpret
-        # or exploit as "not blocked".
         app.logger.exception("Unhandled exception in guardrail policy logic")
         action, reason, result = "block", f"Internal error while evaluating request: {exc}", None
     response = {"action": action, "reason": reason}
